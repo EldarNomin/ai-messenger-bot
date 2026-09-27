@@ -2,129 +2,263 @@
 
 ## 1. Goal
 
-Build a commercial AI assistant available in Telegram and MAX. The initial default model is GLM-5.3-Flash through Z.AI. The architecture must support adding GLM-5.3, Kimi, Qwen, DeepSeek and other OpenAI-compatible providers without rewriting messenger logic.
+Build a commercial AI assistant available in Telegram and MAX with one shared backend. The initial default provider/model is Z.AI / GLM-5.3-Flash, but the product must not depend on a single vendor or expose raw vendor API semantics to normal users.
 
-The product sells convenience, not raw API access: users interact with an assistant inside a messenger, while model selection, limits, billing and routing remain internal.
+The product sells a convenient assistant inside a messenger: conversation context, multimodal inputs, tools, predictable limits and billing. Model selection, policy, costs and routing are internal.
 
-## 2. MVP scope
+Architecture style for the first commercial version: **modular monolith with separate API and worker processes**, PostgreSQL as the source of truth, Redis for ephemeral rate limits/locks/cache.
 
-### Telegram v0.1
+## 2. Product principles
 
-Required:
-- `/start`
-- text chat with GLM-5.3-Flash
-- streamed/periodically edited responses
-- conversation history
-- `/new` / New chat
-- free daily limits
-- request, token and cost accounting
-- Telegram Stars payment abstraction
-- PLUS subscription
-- PostgreSQL persistence
-- Redis rate limiting/cache
-- Docker deployment
-- health/readiness endpoints
-- basic admin statistics
+- simple UX: open -> ask -> receive answer;
+- do not expose API keys;
+- do not make users configure model ids;
+- public UX uses logical modes (`standard`, `deep`, `search`, etc.);
+- no true unlimited plan;
+- complex/expensive modes consume more internal allowance;
+- provider/model can change without breaking product contracts;
+- monetization must be based on actual net revenue and measured cost, not theoretical request counts.
 
-### MAX v0.2
+## 3. MVP scope
 
-Reuse the same backend. Add only platform-specific adapter, webhook handling and payment integration. No AI or billing business logic may be duplicated inside the MAX layer.
+### Telegram paid-launch scope
 
-## 3. UX principles
+Required before accepting production payments:
+- `/start`, `/new`;
+- text chat with GLM-5.3-Flash;
+- progressively updated/streamed responses;
+- conversation history with bounded context;
+- durable inbound-event deduplication;
+- durable background job execution;
+- request state machine;
+- free limits;
+- token/tool/cost accounting;
+- budget reservation + settlement;
+- products/plans/entitlements;
+- Telegram Stars orders/payments/subscriptions;
+- `/terms`, `/privacy`, `/support`, `/paysupport`;
+- refund/reversal support;
+- provider-policy enforcement;
+- PostgreSQL + Redis;
+- automated backups + restore procedure;
+- kill switches and spend alerts;
+- Docker deployment;
+- basic admin statistics.
 
-Primary flow:
-1. User opens bot.
-2. Sends a question immediately.
-3. Bot shows activity and starts returning answer quickly.
-4. Follow-up messages preserve context.
-5. User can start a fresh chat at any time.
+### MAX
 
-Do not expose API keys or force model configuration on normal users.
+MAX reuses the same identity/chat/entitlement/usage/policy/model-routing core. Add only platform-specific transport, account mapping and verified payment integration. Do not assume Telegram Stars semantics exist on MAX.
 
-## 4. Recommended stack
+Current MAX partner eligibility/payment rules must be re-checked before implementation.
+
+## 4. Stack
 
 - Python 3.12+
 - FastAPI
 - aiogram 3 for Telegram
-- httpx for external HTTP APIs
+- httpx for external APIs
 - SQLAlchemy 2 + Alembic
 - PostgreSQL 16+
-- Redis
+- Redis 7+
 - pydantic-settings
-- pytest
+- pytest / pytest-asyncio
 - Docker / Docker Compose
 
-## 5. Architectural boundaries
+Do not introduce Kafka, Kubernetes or independently deployed microservices until measured load/organization complexity justifies them.
 
-Correct dependency direction:
+## 5. Process roles
+
+Same repository/codebase, separate runtime roles:
+
+```text
+api
+  FastAPI + webhooks + health/admin endpoints
+
+worker
+  durable chat/payment/background jobs
+
+scheduler (later)
+  expirations, retention, reconciliation, periodic jobs
+```
+
+## 6. Core dependency direction
 
 ```text
 Telegram/MAX adapter
       ↓
-Application service
+Inbound event normalization / durable inbox
       ↓
-Conversation / Usage / Subscription services
+Application services
+      ↓
+Identity / Chat / Policy / Entitlement / Budget / Billing
       ↓
 Model Router
       ↓
-AIProvider interface
+AIProvider
       ↓
-Z.AI / Kimi / Qwen / other provider
+Z.AI / future providers
 ```
 
 Forbidden:
 
 ```text
 telegram_handler.py -> direct HTTP request to Z.AI
+payment_handler.py -> user.plan = "PLUS"
 ```
 
-Messenger-specific code must not own model selection, subscription rules, cost calculations or conversation policies.
+## 7. Durable webhook flow
 
-## 6. AI provider interface
+Webhook requests must not wait for LLM generation.
 
-All LLMs implement a common interface conceptually equivalent to:
+Required flow:
+
+```text
+incoming webhook
+ -> validate platform secret
+ -> normalize event
+ -> derive external_event_id
+ -> INSERT inbox event with UNIQUE(platform, external_event_id)
+ -> create/mark durable job transactionally
+ -> HTTP 2xx quickly
+ -> worker claims job
+ -> execute application flow
+```
+
+Initial durable queue implementation may be a PostgreSQL `jobs` table claimed with `FOR UPDATE SKIP LOCKED`.
+
+Redis may accelerate queues later, but payment/request truth must not exist only in Redis.
+
+## 8. AI request state machine
+
+Persist each model execution independently from messenger messages.
+
+Statuses:
+
+```text
+received
+queued
+running
+streaming
+completed
+failed
+cancelled
+```
+
+Fields include:
+- id/request_id;
+- user/conversation ids;
+- platform event/message ids;
+- logical mode;
+- provider/model;
+- prompt/model/policy versions;
+- reserved budget;
+- input/cached/output tokens;
+- actual cost;
+- provider request id;
+- latency;
+- failure class;
+- timestamps.
+
+A duplicate platform event must resolve to the existing request and must not create a second paid provider call.
+
+## 9. AI provider interface
 
 ```python
 class AIProvider:
-    async def chat(self, messages, model=None, stream=True, options=None):
+    async def chat(self, request, stream=True):
         ...
 ```
 
-Initial implementation: `ZAIProvider`.
+Provider response must expose normalized:
+- text/chunks;
+- usage;
+- finish reason;
+- provider request id;
+- tool events when supported;
+- provider error classification.
 
-Later providers:
-- KimiProvider
-- QwenProvider
-- OpenAICompatibleProvider
+Initial: `ZAIProvider`.
 
-## 7. Model router
+Tests: `FakeAIProvider` with deterministic streaming/usage/errors.
 
-Initial policy:
-- default -> GLM-5.3-Flash
-- deep -> configurable stronger model
-- vision -> multimodal-capable model
+## 10. Model catalog and logical routing
 
-Routing must be configuration-driven. Never hardcode tariff/business decisions into handlers.
+Product code never routes directly from plan -> vendor model string.
 
-## 8. Streaming
+Logical modes:
+- `standard_chat`;
+- `deep_chat`;
+- `vision_chat`;
+- `document_chat`;
+- `web_search`.
 
-Streaming response UX is required. For Telegram, buffer chunks and edit the message periodically rather than for every token. Target edit cadence: roughly 500–1000 ms, adjusted to API limits.
+Catalog entry contains:
+- provider/model id;
+- active flag;
+- capabilities/modalities;
+- context/output ceilings;
+- pricing version;
+- cost weight;
+- timeouts;
+- provider concurrency limit;
+- fallback group;
+- provider policy profile.
 
-## 9. Conversation context
+Initial mapping:
 
-Each user has conversations with messages.
+```text
+standard_chat -> Z.AI / glm-5.3-flash
+```
 
-Context sent to the model should be bounded:
-- system prompt
-- summarized older context
-- last N messages
-- current user message
+Deep/full model is not part of paid MVP unless margin tests justify it.
 
-Do not resend unlimited lifetime history on every request.
+## 11. Provider policy layer
 
-When history exceeds a configurable threshold, summarize older turns and retain recent messages verbatim.
+Provider Terms/usage restrictions are runtime constraints.
 
-## 10. Data model
+Before routing:
+1. classify request/product scenario as needed;
+2. evaluate selected provider policy profile;
+3. route only to allowed providers;
+4. otherwise return a supported refusal/alternative.
+
+As of 2026-09-28, current Z.AI API Additional Terms allow integration into downstream applications but place responsibility for end-user management/content/data controls on the API customer and restrict specified professional/high-impact use cases. Re-check current terms before launch and on terms updates.
+
+Source snapshot: https://chat.z.ai/legal-agreement/terms-of-service
+
+## 12. Conversation/context
+
+Context is bounded:
+- system prompt;
+- stable conversation summary;
+- recent turns;
+- current message.
+
+Never resend unlimited lifetime history.
+
+Store prompt/template versions.
+
+Use provider-reported token usage for billing. Token estimates may be used for pre-flight budgeting only.
+
+## 13. Budget reservation and settlement
+
+Before any cost-bearing provider/tool call:
+1. resolve entitlements;
+2. estimate maximum permitted cost from context + output cap + modalities/tools;
+3. atomically reserve internal budget/cost units;
+4. reject if reservation exceeds user/global limits;
+5. execute call;
+6. settle actual cost using provider-reported usage and effective price version;
+7. release unused reservation.
+
+Hard controls:
+- per-request max cost;
+- per-user daily/monthly budget;
+- free-tier daily budget;
+- global daily/provider budget;
+- model/tool kill switches.
+
+## 14. Identity
 
 ### users
 - id
@@ -137,262 +271,317 @@ When history exceeds a configurable threshold, summarize older turns and retain 
 - user_id
 - platform
 - external_user_id
-- username
-- first_name
+- username/display metadata
 - created_at
 
-Unique key: `(platform, external_user_id)`.
+Unique `(platform, external_user_id)`.
+
+Telegram and MAX accounts are **not** automatically the same user. Cross-platform linking requires an explicit one-time signed confirmation flow.
+
+## 15. Conversation tables
 
 ### conversations
 - id
 - user_id
-- platform
+- platform/account reference
 - title
 - summary
-- created_at
-- updated_at
-- archived_at
+- summary_version
+- created_at/updated_at/archived_at
 
 ### messages
 - id
 - conversation_id
 - role
-- content
-- model
-- input_tokens
-- output_tokens
-- cost_usd
-- latency_ms
+- content/reference to stored attachment
+- request_id where applicable
 - status
 - created_at
 
-### usage_events
-- id
-- user_id
-- conversation_id
-- provider
-- model
-- input_tokens
-- cached_tokens
-- output_tokens
-- cost_usd
-- request_id
-- created_at
+Token/cost truth belongs primarily to request/usage tables rather than duplicating financial truth in messages.
 
-### processed_events
+## 16. Durable ingress/jobs
+
+### inbox_events
 - platform
 - external_event_id
+- event_type
+- payload or normalized safe subset
+- received_at
 - processed_at
 
-Used for webhook deduplication.
+Unique `(platform, external_event_id)`.
 
-### model_prices
-- provider
-- model
-- input_price
-- cached_input_price
-- output_price
-- effective_from
+### jobs
+- id
+- type
+- dedupe_key
+- payload/reference
+- status
+- attempts
+- available_at
+- locked_at/locked_by
+- last_error_class
+- created_at/updated_at
 
-Prices must be configuration/data, not constants buried in business logic.
+Jobs must be retryable/idempotent.
 
-## 11. Tariffs and limits
+## 17. Usage and pricing
 
-Initial product shape:
-
-### FREE
-- small daily request allowance
-- GLM-5.3-Flash
-- shorter context/output limits
-
-### PLUS
-- higher limits
-- larger context
-- future image/file/voice access
-
-### PRO (later)
-- high limits
-- deep mode
-- stronger models/tools
-
-No true unlimited plan. Internally enforce:
-- requests per minute/day/month
-- tokens per day/month
-- max output tokens
-- max context
-- max concurrent requests
-- daily/monthly cost ceiling
-
-## 12. Billing
-
-Payment code must implement a provider abstraction:
-
-```text
-PaymentProvider
-├── TelegramStarsProvider
-├── MaxPaymentProvider
-└── FutureProvider
-```
-
-Persist external transaction IDs and enforce idempotency so duplicate payment events cannot activate subscriptions twice.
-
-Subscription data must support:
-- plan
-- activation time
-- expiration time
-- renewal state
-- platform payment reference
-
-## 13. Cost controls
-
-Every LLM call records usage and estimated cost.
-
-Support:
-- per-user daily cost cap
-- per-user monthly cost cap
-- global daily spend cap
-- model/provider kill switch
-- free-tier kill switch
-
-If a threshold is exceeded, block further expensive execution and log an alert condition.
-
-## 14. Rate limiting
-
-Use Redis. Initial configurable examples:
-- FREE: 5 req/min + daily cap
-- PLUS: 15 req/min
-- PRO: 30 req/min
-- one concurrent model request per user in MVP
-
-Exact values are configuration, not hardcoded product truth.
-
-## 15. Webhooks
-
-Production integrations use HTTPS webhooks.
-
-Endpoints:
-- `POST /webhooks/telegram`
-- `POST /webhooks/max`
-
-Validate platform webhook secrets and deduplicate repeated events.
-
-## 16. Reliability
-
-For network/429/5xx model failures use controlled retry with exponential backoff, e.g. 1s, 2s, 4s, maximum 3 attempts where safe.
-
-Provider fallback architecture is desirable, but fallback must respect cost ceilings and must not silently route cheap traffic to an unexpectedly expensive model.
-
-## 17. Security
-
-Secrets only through environment/secret manager:
-- TELEGRAM_BOT_TOKEN
-- MAX_BOT_TOKEN
-- ZAI_API_KEY
-- DATABASE_URL
-- REDIS_URL
-- webhook secrets
-- admin secret
-
-Never commit real credentials.
-
-Do not log:
-- bot tokens
-- model API keys
-- payment secrets
-- raw auth headers
-
-User message content should not be duplicated into infrastructure logs unless explicitly required and sanitized.
-
-## 18. Observability
-
-Each model request should have:
+### usage_events
 - request_id
 - user_id
-- conversation_id
-- provider
-- model
-- token usage
-- estimated cost
-- latency
-- status/error class
+- provider/model
+- price_version_id
+- input/cached/output tokens
+- tool units/calls
+- actual cost
+- created_at
 
-Core metrics:
-- users / DAU / WAU / MAU
-- messages/day
-- AI requests/day
-- token usage
-- AI cost
-- revenue
-- gross margin
-- free-to-paid conversion
-- error rate
-- p95 latency
+### model_prices
+- provider/model
+- input/cached/output rates
+- tool rates where applicable
+- currency
+- effective_from/effective_to
 
-## 19. Health endpoints
+Never mutate historical usage cost because today's provider price changed.
 
-`GET /health` — process alive.
+Current reference pricing belongs in `docs/UNIT_ECONOMICS.md`, not hardcoded business logic.
 
-`GET /ready` — verifies dependencies required to serve traffic, initially PostgreSQL and Redis.
+## 18. Products, payments, subscriptions and entitlements
 
-## 20. Testing
+These are separate concepts.
+
+### products/plans
+Marketing/billing product definitions.
+
+### orders
+Intent to purchase a product.
+
+### payment_events
+Append-only external payment facts. External transaction id unique.
+
+### subscriptions
+Platform subscription lifecycle/reference.
+
+### entitlements
+What the user may actually use:
+- standard budget;
+- deep/tool access;
+- context/file ceilings;
+- expiration.
+
+### ledger
+Immutable allowance/credit/budget movements. Refund/reversal uses compensating entries.
+
+Never store money as float. Use integer minor/virtual units and explicit currency/unit type.
+
+## 19. Telegram Stars
+
+Digital goods/services inside Telegram use Stars (`XTR`).
+
+Required:
+- invoice/order id mapping;
+- validate `pre_checkout_query` quickly;
+- only grant entitlement after `successful_payment`;
+- store `telegram_payment_charge_id`;
+- idempotent handling;
+- support refunds;
+- handle multiple/concurrent subscription events safely;
+- `/terms`;
+- `/support` and `/paysupport`;
+- backup payment records.
+
+Do not assume user purchase price per Star equals developer net proceeds. Pricing/margin must use official/current net proceeds and observed revenue.
+
+References:
+- https://core.telegram.org/bots/payments-stars
+- https://core.telegram.org/api/subscriptions
+- https://core.telegram.org/api/stars
+
+## 20. Plans and limits
+
+Suggested shape only; actual prices/allowances follow beta measurements.
+
+### FREE
+- small standard-chat budget;
+- strict rate/concurrency limits;
+- no expensive tools/deep mode.
+
+### PLUS
+- larger monthly standard budget;
+- images/files/voice when enabled;
+- larger context.
+
+### PRO (later)
+- higher budget;
+- explicit deep/tool allowances.
+
+Public UX may show an approximate standard-message allowance. Internally enforce weighted cost units + hard provider-cost ceilings.
+
+## 21. Streaming/delivery
+
+Buffer provider chunks and edit messenger output periodically; never edit once per token.
+
+Store partial failure state. A delivery/edit failure must not automatically repeat the paid model call.
+
+Separate:
+- model execution retry;
+- messenger delivery retry.
+
+## 22. Reliability
+
+External calls require:
+- connect/read/overall timeouts;
+- retry classification;
+- exponential backoff + jitter;
+- circuit breaker;
+- provider concurrency limits;
+- fallback only inside permitted policy/cost/capability groups.
+
+Do not blindly replay tool calls or other side effects.
+
+## 23. Security/privacy
+
+Secrets only through environment/secret manager.
+
+Never log:
+- bot/API tokens;
+- auth headers;
+- payment secrets;
+- raw prompts in general infrastructure logs.
+
+Support:
+- chat deletion;
+- account deletion;
+- configurable retention;
+- provider/privacy/terms version recording where required;
+- encrypted transport;
+- encrypted production storage/backups where available;
+- admin authentication separate from user auth.
+
+## 24. Tools/agent features
+
+No arbitrary general-purpose tools in paid MVP.
+
+When tools are enabled:
+- explicit allowlist;
+- cost budget;
+- max calls/request;
+- timeout;
+- audit trail;
+- SSRF/URL protection;
+- no access to internal metadata networks/secrets;
+- human confirmation for any future side-effecting actions.
+
+## 25. Observability/business metrics
+
+Technical:
+- request/error rate;
+- p50/p95 latency;
+- provider latency/failures;
+- queue age/depth;
+- webhook dedupe/retry rate;
+- DB/Redis health.
+
+Financial/product:
+- DAU/WAU/MAU;
+- activation/retention;
+- free -> paid conversion;
+- net revenue;
+- API/tool cost;
+- contribution margin;
+- cost per active free/paid user;
+- top expensive users;
+- refunds;
+- cost/revenue ratio by plan/model/mode/acquisition source.
+
+## 26. Backups/operations
+
+Before paid production:
+- automated PostgreSQL backups;
+- restore test/runbook;
+- migration procedure;
+- separate staging/production secrets;
+- spend alerts;
+- provider/payment error alerts;
+- global model/tool/free-tier/payment kill switches.
+
+Repository development credentials must never be reused in production.
+
+## 27. Testing
 
 ### Unit
-- model router
-- cost calculator
-- tariff/limit logic
-- context builder
-- subscription logic
+- router/catalog;
+- provider policy gate;
+- cost calculator;
+- budget reservation/settlement;
+- entitlement logic;
+- billing ledger;
+- context builder.
 
 ### Integration
-- PostgreSQL
-- Redis
-- mocked Z.AI
-- Telegram update handling
-- MAX event handling when added
+- PostgreSQL;
+- Redis;
+- job claiming/retry;
+- mocked Z.AI;
+- Telegram updates/payment events;
+- MAX events when added.
 
-### E2E
-- `/start`
-- question -> answer
-- follow-up context
-- `/new`
-- free limit exhaustion
-- successful payment -> PLUS activation
-- subscription expiration
+### Concurrency/idempotency tests
+Required for:
+- duplicate webhook events;
+- concurrent same-user requests;
+- budget reservations;
+- duplicate successful payments;
+- refunds/reversals;
+- worker crash during running/streaming request.
 
-Provide `FakeAIProvider` for deterministic tests. Automated tests must not spend real model tokens.
+No automated test may spend real model tokens.
 
-## 21. MVP acceptance criteria
+## 28. Paid MVP acceptance criteria
 
-A new Telegram user can:
+A new user can:
 1. start the bot;
-2. ask a question;
-3. receive a progressively updated AI response;
-4. continue a contextual conversation;
-5. start a new chat;
-6. see/use a free allowance;
-7. hit the free limit;
-8. purchase a paid plan;
-9. have the plan activated idempotently;
-10. continue chatting under paid limits.
+2. ask and continue a contextual chat;
+3. receive progressively updated responses;
+4. create a new chat;
+5. consume a free allowance;
+6. see a paywall/plan offer;
+7. read Terms/support information;
+8. buy through Telegram Stars;
+9. receive entitlement exactly once even if events repeat;
+10. continue under paid limits;
+11. request payment support/refund handling path.
 
-The system must also:
-- survive restart without losing state;
-- record tokens/costs;
-- enforce rate and spending limits;
-- reject duplicate events/payments safely;
-- keep secrets out of git/logs.
+System properties:
+- webhook ACK independent of LLM latency;
+- restart does not lose durable jobs/payment state;
+- duplicate events do not duplicate provider spend;
+- concurrent requests cannot bypass budgets;
+- provider usage/cost is auditable;
+- provider policy is enforced;
+- backups/restores are tested;
+- secrets/prompts do not leak into normal logs.
 
-## 22. Product expansion after MVP
+## 29. Expansion after validation
 
-After demand validation:
-- MAX adapter
-- images
-- voice transcription/TTS
-- PDF/DOCX/TXT/CSV handling
-- web search
-- deep mode
-- multiple model providers
-- referral/credits system
-- Mini App
-- conversation history UI
-- analytics/admin dashboard
+After real retention/margin data:
+- MAX adapter;
+- images/files/voice;
+- web search;
+- deep mode;
+- multiple providers/fallback;
+- referral/affiliate program;
+- Mini App;
+- richer history/settings/admin UI.
+
+Do not add features merely because GLM supports them; add them when they improve retention/revenue or differentiate the product.
+
+## 30. Related docs
+
+- `docs/ARCHITECTURE.md` — runtime/dependency/billing architecture
+- `docs/ROADMAP.md` — implementation order and launch gates
+- `docs/UNIT_ECONOMICS.md` — cost/pricing model
+- `docs/COMMERCIAL_READINESS.md` — architecture review and P0/P1/P2 priorities
